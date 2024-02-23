@@ -1,0 +1,16 @@
+[package]
+name = "query_consumer"
+version = "0.1.0"
+edition = "2018"
+
+[dependencies]
+rdkafka = "0.36.2"
+parquet = "50.0.0"
+chrono = "0.4.34"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.34.0", features = ["parking_lot", "rt-multi-thread", "macros", "io-util"] }
+tokio-stream = {version = "0.1.14", features = ["net"]}
+log = "0.4.20"
+clap = "4.5.1"
+polars = { version = "0.37.0", features = ["parquet"] }
