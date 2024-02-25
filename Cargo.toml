@@ -14,3 +14,9 @@ tokio-stream = {version = "0.1.14", features = ["net"]}
 log = "0.4.20"
 clap = "4.5.1"
 polars = { version = "0.37.0", features = ["parquet"] }
+simplelog = { version = "0.12.1", features = ["paris"] }
+futures-util = "0.3.30"
+futures = "0.3.30"
+
+[dev-dependencies]
+futures = "0.3.30"
