@@ -10,6 +10,7 @@ pub enum ConsumerError {
     Deserialize(SerdeJsonError),
     InvalidMessage(),
     FileWrite(IoError),
+    Shutdown(),
 }
 
 impl From<JoinError> for ConsumerError {
@@ -44,6 +45,7 @@ impl std::fmt::Display for ConsumerError {
             ConsumerError::Deserialize(e) => write!(f, "DataFrame error: {}", e),
             ConsumerError::InvalidMessage() => write!(f, "Invalid message received"),
             ConsumerError::FileWrite(e) => write!(f, "I/O error: {}", e),
+            ConsumerError::Shutdown() => write!(f, "Shutdown error"),
         }
     }
 }

@@ -1,31 +1,35 @@
+pub mod consumer;
 pub mod errors;
 
+use consumer::LoggingConsumer;
 use errors::{ConsumerError, ConsumerResult};
 
 use clap::{Arg, ArgAction, Command};
 
 use std::error::Error;
 use std::fs::File;
-// use std::iter::FromIterator;
+use std::sync::atomic::{self, AtomicUsize};
 
 use log::{info, warn};
 use simplelog::*;
 
 use futures_util::TryStreamExt;
 
+use tokio::signal;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use polars::prelude::*;
 
 use rdkafka::config::RDKafkaLogLevel;
-use rdkafka::consumer::{Consumer, ConsumerContext, Rebalance, StreamConsumer};
-use rdkafka::error::KafkaResult;
+use rdkafka::consumer::Consumer;
 use rdkafka::message::{BorrowedMessage, Message, OwnedMessage};
 use rdkafka::util::get_rdkafka_version;
-use rdkafka::{ClientContext, TopicPartitionList};
 
 use serde::{Deserialize, Serialize};
+
+use crate::consumer::CustomConsumerContext;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,10 +38,18 @@ struct KafkaQueryBody {
     query: String,
     bind_vars: serde_json::value::Value,
 }
+
 #[derive(Debug, Serialize, Deserialize)]
 struct KafkaMessage {
     name: String,
     body: KafkaQueryBody,
+}
+
+#[allow(dead_code)]
+enum TaskCommand {
+    Message(KafkaMessage),
+    Flush(),
+    Shutdown(),
 }
 
 struct CliArguments {
@@ -45,25 +57,8 @@ struct CliArguments {
     brokers: String,
     consumer_group_id: String,
     write_treshold: usize,
+    debug: bool,
 }
-
-struct CustomContext;
-impl ClientContext for CustomContext {}
-impl ConsumerContext for CustomContext {
-    fn pre_rebalance(&self, rebalance: &Rebalance) {
-        info!("Pre rebalance {:?}", rebalance);
-    }
-
-    fn post_rebalance(&self, rebalance: &Rebalance) {
-        info!("Post rebalance {:?}", rebalance);
-    }
-
-    fn commit_callback(&self, result: KafkaResult<()>, _offsets: &TopicPartitionList) {
-        info!("Committing offsets: {:?}", result);
-    }
-}
-
-type LoggingConsumer = StreamConsumer<CustomContext>;
 
 fn parse_message(msg: &OwnedMessage) -> ConsumerResult<KafkaMessage> {
     let payload = match msg.payload_view::<str>() {
@@ -89,7 +84,8 @@ fn parse_message(msg: &OwnedMessage) -> ConsumerResult<KafkaMessage> {
 // }
 
 fn message_processor<'a>(
-    tx: Sender<DataFrame>,
+    msg_count: Arc<AtomicUsize>,
+    tx: Sender<TaskCommand>,
     borrowed_message: BorrowedMessage<'a>,
 ) -> JoinHandle<ConsumerResult<()>> {
     let owned_message = borrowed_message.detach();
@@ -106,16 +102,12 @@ fn message_processor<'a>(
             tokio::task::spawn_blocking(move || parse_message(&owned_message)).await?;
 
         if let Ok(message) = incoming_message {
-            debug!("Message: {:?}", message.body.query);
-
-            let extension = DataFrame::new(vec![
-                Series::new("timestamp", &[message.body.time]),
-                Series::new("query", &[message.body.query]),
-                Series::new("bind_vars", &[message.body.bind_vars.to_string()]),
-            ])?;
-
-            tx.send(extension).await.unwrap();
-
+            if !tx.is_closed() {
+                tx.send(TaskCommand::Message(message))
+                    .await
+                    .map_err(|_| ConsumerError::Shutdown())?;
+            }
+            msg_count.fetch_add(1, atomic::Ordering::Relaxed);
             return Ok(());
         }
 
@@ -135,63 +127,106 @@ fn message_processor<'a>(
 //     })
 // }
 
-async fn sink_task(treshold: usize, mut rx: Receiver<DataFrame>, mut data_frame: DataFrame) -> () {
-    let mut writes: usize = 0;
+fn write_dataframe(
+    filename: &str,
+    timestamps: &Vec<i64>,
+    queries: &Vec<String>,
+    bind_vars: &Vec<String>,
+) -> ConsumerResult<()> {
+    let len = timestamps.len();
+    let start_time = std::time::Instant::now();
+    info!("Flushing {} records dataframe to disk: {}", len, filename);
 
-    while let Some(extension) = rx.recv().await {
-        debug!("Received frame to process");
+    let mut data_frame = df!(
+        "timestamp" => &timestamps,
+        "query" => &queries,
+        "bind_vars" => &bind_vars,
+    )?
+    .sort(["timestamp"], true, false)?;
 
-        data_frame = match data_frame.extend(&extension) {
-            Ok(_) => data_frame,
-            Err(e) => {
-                error!("Error extending DataFrame: {:?}", e);
-                data_frame
+    let file = File::create(filename)?;
+    ParquetWriter::new(file).finish(&mut data_frame)?;
+
+    info!(
+        "Flushing {} records dataframe took {:?}",
+        len,
+        start_time.elapsed()
+    );
+
+    Ok(())
+}
+
+async fn sink_task(
+    msg_count: Arc<AtomicUsize>,
+    cancel_token: CancellationToken,
+    treshold: usize,
+    mut rx: Receiver<TaskCommand>,
+) -> () {
+    let mut flushes: usize = 0;
+    let mut timestamps: Vec<i64> = Vec::new();
+    let mut queries: Vec<String> = Vec::new();
+    let mut bind_vars: Vec<String> = Vec::new();
+
+    let mut shutdown = false;
+    let mut forced_flush = false;
+
+    //while let Some(command) = rx.recv().await {
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                info!("Sync task cancelling...");
+                shutdown = true;
+                forced_flush = true;
             }
-        };
-
-        debug!("DataFrame height {} / {}", data_frame.height(), treshold);
-
-        if data_frame.height() >= treshold {
-            writes += 1;
-
-            let start_time = std::time::Instant::now();
-
-            if data_frame.should_rechunk() {
-                data_frame.align_chunks();
+            Some(command) = rx.recv() => {
+                match command {
+                    TaskCommand::Message(message) => {
+                        timestamps.push(message.body.time);
+                        queries.push(message.body.query);
+                        bind_vars.push(message.body.bind_vars.to_string());
+                        debug!("Sink buffer {} / {}", timestamps.len(), msg_count.load(atomic::Ordering::Relaxed));
+                    }
+                    TaskCommand::Flush() => {
+                        forced_flush = true;
+                    }
+                    TaskCommand::Shutdown() => {
+                        info!("Received sync shutdown");
+                        forced_flush = true;
+                        shutdown = true;
+                    }
+                }
             }
+        }
 
-            let filename = format!("queries-{}.parquet", writes);
-            info!(
-                "Flushing {} records dataframe to disk: {}",
-                treshold, filename
-            );
-
-            let file = File::create(filename);
-            if let Err(e) = file {
-                error!("Failed to create file: {:?}", e);
-                continue;
-            }
-
-            let written = ParquetWriter::new(file.unwrap()).finish(&mut data_frame);
+        let should_flush = timestamps.len() >= treshold || shutdown;
+        if should_flush || forced_flush {
+            let filename = format!("queries-{}.parquet", flushes + 1);
+            let written = write_dataframe(&filename, &timestamps, &queries, &bind_vars);
             if let Err(e) = written {
                 error!("Failed to write file: {:?}", e);
                 continue;
             }
 
-            data_frame = data_frame.clear();
+            flushes += 1;
 
-            info!(
-                "Flushing {} records dataframe took {:?}",
-                treshold,
-                start_time.elapsed()
-            );
+            timestamps.clear();
+            queries.clear();
+            bind_vars.clear();
+        }
+
+        if shutdown {
+            info!("Terminating sync task...");
+            return;
         }
     }
 }
 
-async fn consume(args: CliArguments) -> Result<(), Box<dyn Error>> {
+async fn consume(
+    cancel_token: CancellationToken,
+    args: CliArguments,
+) -> Result<(), Box<dyn Error>> {
     // Kafka consumer configuration
-    let context = CustomContext;
+    let context = CustomConsumerContext;
     let consumer: LoggingConsumer = rdkafka::config::ClientConfig::new()
         .set("group.id", args.consumer_group_id)
         .set("bootstrap.servers", args.brokers)
@@ -210,47 +245,46 @@ async fn consume(args: CliArguments) -> Result<(), Box<dyn Error>> {
         .subscribe(&topics)
         .expect("failed to subscribe to topics");
 
-    let data_frame = DataFrame::new(vec![
-        Series::new("timestamp", vec![0i64]),
-        Series::new("query", &[String::from("")]),
-        Series::new("bind_vars", &[String::from("")]),
-    ])?;
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<DataFrame>(1000);
+    let (tx, rx) = tokio::sync::mpsc::channel::<TaskCommand>(1000);
 
     let treshold = args.write_treshold;
+    let atomic_msg_count = Arc::new(AtomicUsize::new(0));
 
-    let sink_task = tokio::task::spawn(sink_task(treshold, rx, data_frame));
+    let sink_task = tokio::task::spawn(sink_task(
+        atomic_msg_count.clone(),
+        cancel_token.clone(),
+        treshold,
+        rx,
+    ));
 
     let consume_task = consumer.stream().try_for_each(|borrowed_message| {
         let tx = tx.clone();
+        let cancel_token = cancel_token.clone();
+        let atomic_msg_count = atomic_msg_count.clone();
         async move {
-            message_processor(tx, borrowed_message);
+            if !cancel_token.is_cancelled() {
+                message_processor(atomic_msg_count, tx, borrowed_message);
+            }
             Ok(())
         }
     });
 
-    info!("Starting processing loop");
-    consume_task.await.expect("stream processing failed");
-    info!("Stream processing terminated");
+    info!("Starting consumption loop");
 
-    sink_task.abort();
+    tokio::select! {
+        _ = consume_task => {
+            info!("Consume task exited.");
+        }
+        _  = sink_task => {
+            info!("Sink task exited.");
+        }
+    }
 
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    CombinedLogger::init(vec![TermLogger::new(
-        LevelFilter::Info,
-        Config::default(),
-        TerminalMode::Mixed,
-        ColorChoice::Auto,
-    )])
-    .unwrap();
-
-    info!("startup");
-
     let mut matches = Command::new("query-consumer")
         .version(option_env!("CARGO_PKG_VERSION").unwrap_or(""))
         .about("Simple command line consumer to parquet")
@@ -289,23 +323,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .value_parser(clap::value_parser!(usize))
                 .default_value("10000"),
         )
+        .arg(
+            Arg::new("debug")
+                .short('d')
+                .long("debug")
+                .action(ArgAction::SetTrue)
+                .help("Debug logging"),
+        )
         .get_matches();
+
+    let cli_args = CliArguments {
+        topics: matches.remove_many("topics").unwrap().collect(),
+        brokers: matches.remove_one::<String>("brokers").unwrap(),
+        consumer_group_id: matches.remove_one::<String>("consumer-group-id").unwrap(),
+        write_treshold: matches.remove_one::<usize>("write-treshold").unwrap(),
+        debug: matches.remove_one::<bool>("debug").unwrap(),
+    };
+
+    let log_level = if cli_args.debug {
+        LevelFilter::Debug
+    } else {
+        LevelFilter::Info
+    };
+
+    CombinedLogger::init(vec![TermLogger::new(
+        log_level,
+        Config::default(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    )])
+    .unwrap();
+
+    info!("query_consumer v{}", env!("CARGO_PKG_VERSION"));
 
     let (version_n, version_s) = get_rdkafka_version();
     info!("rd_kafka_version: 0x{:08x}, {}", version_n, version_s);
 
-    let topics = matches.remove_many("topics").unwrap().collect();
-    let brokers = matches.remove_one::<String>("brokers").unwrap();
-    let consumer_group_id = matches.remove_one::<String>("consumer-group-id").unwrap();
-    let write_treshold: usize = matches.remove_one::<usize>("write-treshold").unwrap();
-
-    let cli_args = CliArguments {
-        topics,
-        brokers,
-        consumer_group_id,
-        write_treshold,
-    };
-
     info!("Starting consumer");
-    consume(cli_args).await
+
+    let cancel_token = CancellationToken::new();
+    let child_token = cancel_token.child_token();
+
+    tokio::spawn(async move {
+        signal::ctrl_c().await.unwrap();
+        info!("CTRL-C received...terminating tasks");
+        cancel_token.cancel();
+    });
+
+    consume(child_token, cli_args).await?;
+
+    info!("Exiting.");
+
+    Ok(())
 }
