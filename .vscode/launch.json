@@ -11,7 +11,9 @@
             "program": "${workspaceRoot}/target/debug/query_consumer",
             "args": [
                 "-t","sc_entitygraph_querylog",
-                "-g", "boo3"
+                "-g", "kk139",
+                "-c", "1",
+            
             ],
             "cwd": "${workspaceRoot}",
         }
