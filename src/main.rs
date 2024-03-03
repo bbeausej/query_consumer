@@ -6,6 +6,7 @@ use consumer::LoggingConsumer;
 use errors::{ConsumerError, ConsumerResult};
 
 use clap::{Arg, ArgAction, Command};
+use polars::io::parquet::BatchedWriter;
 
 use std::error::Error;
 use std::fs::File;
@@ -24,7 +25,7 @@ use polars::prelude::*;
 
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::Consumer;
-use rdkafka::message::Message;
+use rdkafka::message::{BorrowedMessage, Message};
 use rdkafka::util::get_rdkafka_version;
 
 use serde::{Deserialize, Serialize};
@@ -56,36 +57,37 @@ struct CliArguments {
     topics: Vec<String>,
     brokers: String,
     consumer_group_id: String,
-    write_treshold: usize,
+    flush_treshold: usize,
+    rotate_treshold: usize,
     debug: bool,
     workers: usize,
 }
 
-// fn parse_message(msg: &BorrowedMessage) -> ConsumerResult<KafkaMessage> {
-//     let start_time = std::time::Instant::now();
+fn parse_message(msg: &BorrowedMessage) -> ConsumerResult<KafkaMessage> {
+    let start_time = std::time::Instant::now();
 
-//     let payload = match msg.payload_view::<str>() {
-//         None => "",
-//         Some(Ok(s)) => s,
-//         Some(Err(e)) => {
-//             warn!("Error while deserializing message payload: {:?}", e);
-//             ""
-//         }
-//     };
+    let payload = match msg.payload_view::<str>() {
+        None => "",
+        Some(Ok(s)) => s,
+        Some(Err(e)) => {
+            warn!("Error while deserializing message payload: {:?}", e);
+            ""
+        }
+    };
 
-//     let kafka_message: KafkaMessage = serde_json::from_str(payload)?;
+    let kafka_message: KafkaMessage = serde_json::from_str(payload)?;
 
-//     let elapsed = start_time.elapsed().as_millis();
-//     if elapsed > 10 {
-//         info!(
-//             "Deserialize time: {:?} len {:?}",
-//             start_time.elapsed(),
-//             format_size(payload.len(), BINARY),
-//         );
-//     }
+    let elapsed = start_time.elapsed().as_millis();
+    if elapsed > 10 {
+        debug!(
+            "Deserialize time: {:?} len {:?}",
+            start_time.elapsed(),
+            format_size(payload.len(), BINARY),
+        );
+    }
 
-//     Ok(kafka_message)
-// }
+    Ok(kafka_message)
+}
 
 async fn report_task(
     read_msg_count: Arc<AtomicUsize>,
@@ -115,15 +117,30 @@ async fn report_task(
     })
 }
 
+fn get_schema() -> Schema {
+    Schema::from_iter(vec![
+        Field::new("timestamp", DataType::Int64),
+        Field::new("query", DataType::String),
+        Field::new("bind_vars", DataType::String),
+    ])
+}
+
+fn open_dataframe_file(filename: &str) -> ConsumerResult<BatchedWriter<File>> {
+    let file = File::create(filename)?;
+    let file_writer = ParquetWriter::new(file);
+    let batched = file_writer.batched(&get_schema())?;
+    Ok(batched)
+}
+
 fn write_dataframe(
-    filename: &str,
+    writer: &mut BatchedWriter<File>,
     timestamps: &Vec<i64>,
     queries: &Vec<String>,
     bind_vars: &Vec<String>,
 ) -> ConsumerResult<()> {
     let len = timestamps.len();
     let start_time = std::time::Instant::now();
-    info!("Flushing {} records dataframe to disk: {}", len, filename);
+    info!("Flushing {} records dataframe to disk", len);
 
     let mut data_frame = df!(
         "timestamp" => &timestamps,
@@ -132,8 +149,7 @@ fn write_dataframe(
     )?
     .sort(["timestamp"], true, false)?;
 
-    let file = File::create(filename)?;
-    ParquetWriter::new(file).finish(&mut data_frame)?;
+    writer.write_batch(&mut data_frame)?;
 
     info!(
         "Flushing {} records dataframe took {:?}",
@@ -148,15 +164,20 @@ fn sink_task(
     worker_id: usize,
     msg_count: Arc<AtomicUsize>,
     cancel_token: CancellationToken,
-    treshold: usize,
+    flush_treshold: usize,
+    rotate_treshold: usize,
     mut rx: Receiver<TaskCommand>,
 ) -> () {
-    let mut flushes: usize = 0;
-    let mut timestamps: Vec<i64> = Vec::with_capacity(treshold);
-    let mut queries: Vec<String> = Vec::with_capacity(treshold);
-    let mut bind_vars: Vec<String> = Vec::with_capacity(treshold);
+    let mut rotations: usize = 0;
+    let mut flushed: usize = 0;
+    let mut timestamps: Vec<i64> = Vec::with_capacity(flush_treshold);
+    let mut queries: Vec<String> = Vec::with_capacity(flush_treshold);
+    let mut bind_vars: Vec<String> = Vec::with_capacity(flush_treshold);
 
     let mut shutdown = false;
+
+    let filename = format!("queries-{}-{}.parquet", worker_id, rotations + 1);
+    let mut writer: BatchedWriter<File> = open_dataframe_file(&filename).unwrap();
 
     loop {
         let mut forced_flush = false;
@@ -178,31 +199,44 @@ fn sink_task(
                     forced_flush = true;
                 }
                 TaskCommand::Shutdown() => {
-                    info!("Received sync shutdown");
+                    info!("[{}] Received sync task shutdown", worker_id);
                     forced_flush = true;
                     shutdown = true;
                 }
             }
         }
 
-        let should_flush = timestamps.len() >= treshold || shutdown;
+        let should_flush = timestamps.len() >= flush_treshold || shutdown;
         if should_flush || forced_flush {
-            let filename = format!("queries-{}-{}.parquet", worker_id, flushes + 1);
-            let written = write_dataframe(&filename, &timestamps, &queries, &bind_vars);
+            let written = write_dataframe(&mut writer, &timestamps, &queries, &bind_vars);
             if let Err(e) = written {
-                error!("Failed to write file: {:?}", e);
+                error!("[{}] Failed to write file: {:?}", worker_id, e);
                 continue;
             }
 
-            flushes += 1;
+            flushed += timestamps.len();
 
             timestamps.clear();
             queries.clear();
             bind_vars.clear();
         }
 
+        let should_rotate = flushed >= rotate_treshold;
+        if should_rotate {
+            info!("[{}] Rotating output file", worker_id);
+            writer.finish().unwrap();
+
+            flushed = 0;
+            rotations += 1;
+
+            writer = open_dataframe_file(
+                format!("queries-{}-{}.parquet", worker_id, rotations + 1).as_str(),
+            )
+            .unwrap();
+        }
         if shutdown {
-            info!("Terminating sync task...");
+            info!("[{}] Terminating worker sync task...", worker_id);
+            writer.finish().unwrap();
             return;
         }
     }
@@ -218,7 +252,7 @@ async fn run_worker(
     let consumer: LoggingConsumer = rdkafka::config::ClientConfig::new()
         .set("group.id", &args.consumer_group_id)
         .set("bootstrap.servers", &args.brokers)
-        .set("enable.partition.eof", "true")
+        .set("enable.partition.eof", "false")
         .set("session.timeout.ms", "6000")
         .set("enable.auto.commit", "true")
         .set("auto.offset.reset", "beginning")
@@ -231,11 +265,12 @@ async fn run_worker(
     // Subscribe to Kafka topic
     consumer
         .subscribe(&topics)
-        .expect("failed to subscribe to topics");
+        .expect(format!("[{}] failed to subscribe to topics", worker_id).as_str());
 
     let (tx, rx) = tokio::sync::mpsc::channel(1000);
 
-    let treshold = args.write_treshold;
+    let flush_treshold = args.flush_treshold;
+    let rotate_treshold = args.rotate_treshold;
 
     let read_msg_count = Arc::new(AtomicUsize::new(0));
     let sink_msg_count = Arc::new(AtomicUsize::new(0));
@@ -248,13 +283,20 @@ async fn run_worker(
     let runtime_handle = Handle::current();
 
     std::thread::scope(move |scope| {
-        info!("Starting worker {} sink thread", worker_id);
+        info!("[{}] Starting sink thread", worker_id);
         let sink_cancel_token = cancel_token.clone();
         scope.spawn(move || {
-            sink_task(worker_id, sink_msg_count, sink_cancel_token, treshold, rx);
+            sink_task(
+                worker_id,
+                sink_msg_count,
+                sink_cancel_token,
+                flush_treshold,
+                rotate_treshold,
+                rx,
+            );
         });
 
-        info!("Starting worker {} consumption thread", worker_id);
+        info!("[{}] Starting consumption thread", worker_id);
         let consume_cancel_token = cancel_token.clone();
 
         scope.spawn(move || {
@@ -265,30 +307,11 @@ async fn run_worker(
                     }
 
                     match consumer.recv().await {
-                        Err(e) => warn!("Kafka error: {}", e),
+                        Err(e) => warn!("[{}] Kafka error: {}", worker_id, e),
                         Ok(msg) => {
-                            let start_time = std::time::Instant::now();
-                            let payload = match msg.payload_view::<str>() {
-                                None => "",
-                                Some(Ok(s)) => s,
-                                Some(Err(e)) => {
-                                    warn!("Error while deserializing message payload: {:?}", e);
-                                    ""
-                                }
-                            };
-
-                            let kmsg = serde_json::from_str::<KafkaMessage>(payload);
+                            let kmsg = parse_message(&msg);
 
                             if let Ok(msg) = kmsg {
-                                let elapsed = start_time.elapsed().as_millis();
-                                if elapsed > 10 {
-                                    info!(
-                                        "Deserialize time: {:?} len {:?}",
-                                        start_time.elapsed(),
-                                        format_size(payload.len(), BINARY),
-                                    );
-                                }
-
                                 read_msg_count.fetch_add(1, atomic::Ordering::Relaxed);
 
                                 if !tx.is_closed() {
@@ -344,12 +367,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .required(true),
         )
         .arg(
-            Arg::new("msg-per-file")
-                .short('m')
-                .long("msg-per-file")
-                .help("Message per file")
+            Arg::new("flush-treshold")
+                .long("flush-treshold")
+                .help("Messages accumulated before flushing to disk")
                 .value_parser(clap::value_parser!(usize))
-                .default_value("5000"),
+                .default_value("10000"),
+        )
+        .arg(
+            Arg::new("rotate-treshold")
+                .long("rotate-treshold")
+                .help("Messages per file")
+                .value_parser(clap::value_parser!(usize))
+                .default_value("100000"),
         )
         .arg(
             Arg::new("debug")
@@ -372,7 +401,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         topics: matches.remove_many("topics").unwrap().collect(),
         brokers: matches.remove_one::<String>("brokers").unwrap(),
         consumer_group_id: matches.remove_one::<String>("consumer-group-id").unwrap(),
-        write_treshold: matches.remove_one::<usize>("msg-per-file").unwrap(),
+        flush_treshold: matches.remove_one::<usize>("flush-treshold").unwrap(),
+        rotate_treshold: matches.remove_one::<usize>("rotate-treshold").unwrap(),
         debug: matches.remove_one::<bool>("debug").unwrap(),
         workers: matches.remove_one::<usize>("workers").unwrap(),
     });
@@ -395,8 +425,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let (version_n, version_s) = get_rdkafka_version();
     info!("rd_kafka_version: 0x{:08x}, {}", version_n, version_s);
-
-    info!("Starting consumer");
 
     let cancel_token = CancellationToken::new();
     let child_token = cancel_token.child_token();
