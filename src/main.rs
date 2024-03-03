@@ -1,13 +1,11 @@
 pub mod consumer;
 pub mod errors;
+use crate::consumer::CustomConsumerContext;
 
 use consumer::LoggingConsumer;
 use errors::{ConsumerError, ConsumerResult};
 
 use clap::{Arg, ArgAction, Command};
-use futures::io::sink;
-use futures::stream::FuturesUnordered;
-use futures::{Future, StreamExt};
 
 use std::error::Error;
 use std::fs::File;
@@ -18,7 +16,7 @@ use simplelog::*;
 
 use tokio::runtime::Handle;
 use tokio::signal;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -26,20 +24,19 @@ use polars::prelude::*;
 
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::Consumer;
-use rdkafka::message::{Message, OwnedMessage};
+use rdkafka::message::Message;
 use rdkafka::util::get_rdkafka_version;
 
 use serde::{Deserialize, Serialize};
-use serde_json::value::Value;
 
-use crate::consumer::CustomConsumerContext;
+use humansize::{format_size, BINARY};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct KafkaQueryBody {
     time: i64,
     query: String,
-    bind_vars: Value,
+    bind_vars: serde_json::value::Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -61,71 +58,34 @@ struct CliArguments {
     consumer_group_id: String,
     write_treshold: usize,
     debug: bool,
-    concurrency: usize,
+    workers: usize,
 }
 
-fn parse_message<'msg>(msg: &'msg OwnedMessage) -> ConsumerResult<KafkaMessage> {
-    let start_time = std::time::Instant::now();
+// fn parse_message(msg: &BorrowedMessage) -> ConsumerResult<KafkaMessage> {
+//     let start_time = std::time::Instant::now();
 
-    let payload = match msg.payload_view::<str>() {
-        None => "",
-        Some(Ok(s)) => s,
-        Some(Err(e)) => {
-            warn!("Error while deserializing message payload: {:?}", e);
-            ""
-        }
-    };
+//     let payload = match msg.payload_view::<str>() {
+//         None => "",
+//         Some(Ok(s)) => s,
+//         Some(Err(e)) => {
+//             warn!("Error while deserializing message payload: {:?}", e);
+//             ""
+//         }
+//     };
 
-    let kafka_message: KafkaMessage = serde_json::from_str(payload)?;
+//     let kafka_message: KafkaMessage = serde_json::from_str(payload)?;
 
-    let elapsed = start_time.elapsed().as_millis();
-    if elapsed > 10 {
-        info!(
-            "Deserialize time: {:?} len {:?}",
-            start_time.elapsed(),
-            payload.len()
-        );
-    }
+//     let elapsed = start_time.elapsed().as_millis();
+//     if elapsed > 10 {
+//         info!(
+//             "Deserialize time: {:?} len {:?}",
+//             start_time.elapsed(),
+//             format_size(payload.len(), BINARY),
+//         );
+//     }
 
-    Ok(kafka_message)
-}
-
-// fn get_schema() -> Schema {
-//     Schema::from_iter(vec![
-//         Field::new("timestamp", DataType::Int64),
-//         Field::new("query", DataType::String),
-//         Field::new("bind_vars", DataType::String),
-//     ])
+//     Ok(kafka_message)
 // }
-
-fn message_processor<'msg>(
-    msg_count: Arc<AtomicUsize>,
-    tx: Sender<TaskCommand>,
-    owned_message: OwnedMessage,
-) -> JoinHandle<ConsumerResult<()>> {
-    tokio::spawn(async move {
-        debug!(
-            "Incoming message from topic: {} partition: {} offset: {}",
-            owned_message.topic(),
-            owned_message.partition(),
-            owned_message.offset()
-        );
-
-        let incoming_message = parse_message(&owned_message);
-
-        if let Ok(msg) = incoming_message {
-            if !tx.is_closed() {
-                tx.send(TaskCommand::Message(msg))
-                    .await
-                    .map_err(|_| ConsumerError::Shutdown())?;
-            }
-            msg_count.fetch_add(1, atomic::Ordering::Relaxed);
-            return Ok(());
-        }
-
-        Err(ConsumerError::InvalidMessage())
-    })
-}
 
 async fn report_task(
     read_msg_count: Arc<AtomicUsize>,
@@ -185,6 +145,7 @@ fn write_dataframe(
 }
 
 fn sink_task(
+    worker_id: usize,
     msg_count: Arc<AtomicUsize>,
     cancel_token: CancellationToken,
     treshold: usize,
@@ -210,7 +171,7 @@ fn sink_task(
                 TaskCommand::Message(message) => {
                     timestamps.push(message.body.time);
                     queries.push(message.body.query);
-                    // bind_vars.push(message.body.bind_vars.to_string());
+                    bind_vars.push(message.body.bind_vars.to_string());
                     msg_count.fetch_add(1, atomic::Ordering::Relaxed);
                 }
                 TaskCommand::Flush() => {
@@ -226,7 +187,7 @@ fn sink_task(
 
         let should_flush = timestamps.len() >= treshold || shutdown;
         if should_flush || forced_flush {
-            let filename = format!("queries-{}.parquet", flushes + 1);
+            let filename = format!("queries-{}-{}.parquet", worker_id, flushes + 1);
             let written = write_dataframe(&filename, &timestamps, &queries, &bind_vars);
             if let Err(e) = written {
                 error!("Failed to write file: {:?}", e);
@@ -247,16 +208,17 @@ fn sink_task(
     }
 }
 
-async fn consume(
+async fn run_worker(
+    worker_id: usize,
     cancel_token: CancellationToken,
-    args: CliArguments,
-) -> Result<(), Box<dyn Error>> {
+    args: Arc<CliArguments>,
+) -> ConsumerResult<()> {
     // Kafka consumer configuration
     let context = CustomConsumerContext;
     let consumer: LoggingConsumer = rdkafka::config::ClientConfig::new()
-        .set("group.id", args.consumer_group_id)
-        .set("bootstrap.servers", args.brokers)
-        .set("enable.partition.eof", "false")
+        .set("group.id", &args.consumer_group_id)
+        .set("bootstrap.servers", &args.brokers)
+        .set("enable.partition.eof", "true")
         .set("session.timeout.ms", "6000")
         .set("enable.auto.commit", "true")
         .set("auto.offset.reset", "beginning")
@@ -273,54 +235,78 @@ async fn consume(
 
     let (tx, rx) = tokio::sync::mpsc::channel(1000);
 
-    let treshold = args.write_treshold.clone();
+    let treshold = args.write_treshold;
 
     let read_msg_count = Arc::new(AtomicUsize::new(0));
     let sink_msg_count = Arc::new(AtomicUsize::new(0));
 
-    tokio::spawn(report_task(
+    tokio::task::spawn(report_task(
         Arc::clone(&read_msg_count),
         Arc::clone(&sink_msg_count),
     ));
 
-    let sink_cancel_token = cancel_token.clone();
-    let sink_task = tokio::task::spawn_blocking(move || {
-        sink_task(sink_msg_count, sink_cancel_token, treshold, rx)
-    });
+    let runtime_handle = Handle::current();
 
-    let consume_task = tokio::task::spawn_blocking(move || {
-        Handle::current().block_on(async move {
-            let mut futures: FuturesUnordered<_> = FuturesUnordered::new();
-            while let Ok(borrowed_message) = consumer.stream().next().await.unwrap() {
-                if futures.len() > args.concurrency {
-                    futures.next().await;
+    std::thread::scope(move |scope| {
+        info!("Starting worker {} sink thread", worker_id);
+        let sink_cancel_token = cancel_token.clone();
+        scope.spawn(move || {
+            sink_task(worker_id, sink_msg_count, sink_cancel_token, treshold, rx);
+        });
+
+        info!("Starting worker {} consumption thread", worker_id);
+        let consume_cancel_token = cancel_token.clone();
+
+        scope.spawn(move || {
+            runtime_handle.block_on(async move {
+                loop {
+                    if consume_cancel_token.is_cancelled() {
+                        return;
+                    }
+
+                    match consumer.recv().await {
+                        Err(e) => warn!("Kafka error: {}", e),
+                        Ok(msg) => {
+                            let start_time = std::time::Instant::now();
+                            let payload = match msg.payload_view::<str>() {
+                                None => "",
+                                Some(Ok(s)) => s,
+                                Some(Err(e)) => {
+                                    warn!("Error while deserializing message payload: {:?}", e);
+                                    ""
+                                }
+                            };
+
+                            let kmsg = serde_json::from_str::<KafkaMessage>(payload);
+
+                            if let Ok(msg) = kmsg {
+                                let elapsed = start_time.elapsed().as_millis();
+                                if elapsed > 10 {
+                                    info!(
+                                        "Deserialize time: {:?} len {:?}",
+                                        start_time.elapsed(),
+                                        format_size(payload.len(), BINARY),
+                                    );
+                                }
+
+                                read_msg_count.fetch_add(1, atomic::Ordering::Relaxed);
+
+                                if !tx.is_closed() {
+                                    tx.send(TaskCommand::Message(msg)).await.ok();
+                                }
+                            } else {
+                                error!(
+                                    "Failed to deserialize message {}-{}",
+                                    msg.partition(),
+                                    msg.offset()
+                                );
+                            }
+                        }
+                    }
                 }
-
-                let tx = tx.clone();
-                let cancel_token = cancel_token.clone();
-                let read_msg_count = read_msg_count.clone();
-
-                futures.push(message_processor(
-                    read_msg_count,
-                    tx,
-                    borrowed_message.detach(),
-                ));
-
-                while let Some(_) = futures.next().await {}
-            }
+            })
         });
     });
-
-    info!("Starting consumption loop");
-
-    tokio::select! {
-        _ = consume_task => {
-            info!("Consume task exited.");
-        }
-        _  = sink_task => {
-            info!("Sink task exited.");
-        }
-    }
 
     Ok(())
 }
@@ -358,12 +344,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .required(true),
         )
         .arg(
-            Arg::new("write-treshold")
-                .short('w')
-                .long("write-treshold")
-                .help("Write treshold")
+            Arg::new("msg-per-file")
+                .short('m')
+                .long("msg-per-file")
+                .help("Message per file")
                 .value_parser(clap::value_parser!(usize))
-                .default_value("10000"),
+                .default_value("5000"),
         )
         .arg(
             Arg::new("debug")
@@ -373,23 +359,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .help("Debug logging"),
         )
         .arg(
-            Arg::new("concurrency")
-                .short('c')
-                .long("concurrency")
+            Arg::new("workers")
+                .short('w')
+                .long("workers")
                 .value_parser(clap::value_parser!(usize))
-                .help("Read messages concurrency")
-                .default_value("100"),
+                .help("Numbers of workers")
+                .default_value("1"),
         )
         .get_matches();
 
-    let cli_args = CliArguments {
+    let cli_args = Arc::new(CliArguments {
         topics: matches.remove_many("topics").unwrap().collect(),
         brokers: matches.remove_one::<String>("brokers").unwrap(),
         consumer_group_id: matches.remove_one::<String>("consumer-group-id").unwrap(),
-        write_treshold: matches.remove_one::<usize>("write-treshold").unwrap(),
+        write_treshold: matches.remove_one::<usize>("msg-per-file").unwrap(),
         debug: matches.remove_one::<bool>("debug").unwrap(),
-        concurrency: matches.remove_one::<usize>("concurrency").unwrap(),
-    };
+        workers: matches.remove_one::<usize>("workers").unwrap(),
+    });
 
     let log_level = if cli_args.debug {
         LevelFilter::Debug
@@ -421,7 +407,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
         cancel_token.cancel();
     });
 
-    consume(child_token, cli_args).await?;
+    let num_workers = cli_args.workers;
+
+    info!("Starting {} workers...", num_workers);
+
+    let handle = Arc::new(Handle::current());
+
+    std::thread::scope(|scope| {
+        (0..num_workers)
+            .map(|worker_id| {
+                info!("Starting worker {}", worker_id);
+                let child_token = child_token.clone();
+                let args = Arc::clone(&cli_args);
+                let handle = Arc::clone(&handle);
+                scope.spawn(move || {
+                    handle.block_on(run_worker(worker_id, child_token, args))?;
+                    Ok::<(), ConsumerError>(())
+                })
+            })
+            .for_each(drop);
+    });
 
     info!("Exiting.");
 
