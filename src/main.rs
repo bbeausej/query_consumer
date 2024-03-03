@@ -9,7 +9,8 @@ use clap::{Arg, ArgAction, Command};
 use polars::io::parquet::BatchedWriter;
 
 use std::error::Error;
-use std::fs::File;
+use std::fs::{create_dir_all, File};
+use std::path::Path;
 use std::sync::atomic::{self, AtomicUsize};
 
 use log::{info, warn};
@@ -31,6 +32,9 @@ use rdkafka::util::get_rdkafka_version;
 use serde::{Deserialize, Serialize};
 
 use humansize::{format_size, BINARY};
+
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,6 +58,7 @@ enum TaskCommand {
 }
 
 struct CliArguments {
+    outpath: String,
     topics: Vec<String>,
     brokers: String,
     consumer_group_id: String,
@@ -117,7 +122,7 @@ async fn report_task(
     })
 }
 
-fn get_schema() -> Schema {
+fn get_dataframe_schema() -> Schema {
     Schema::from_iter(vec![
         Field::new("timestamp", DataType::Int64),
         Field::new("query", DataType::String),
@@ -125,14 +130,19 @@ fn get_schema() -> Schema {
     ])
 }
 
-fn open_dataframe_file(filename: &str) -> ConsumerResult<BatchedWriter<File>> {
-    let file = File::create(filename)?;
-    let file_writer = ParquetWriter::new(file);
-    let batched = file_writer.batched(&get_schema())?;
+fn open_dataframe_file(outpath: &str, filename: &str) -> ConsumerResult<BatchedWriter<File>> {
+    let path = Path::new(outpath);
+    create_dir_all(path)?;
+
+    let file = File::create(path.join(filename))?;
+    let mut file_writer = ParquetWriter::new(file);
+    file_writer = file_writer.set_parallel(true);
+    let batched = file_writer.batched(&get_dataframe_schema())?;
     Ok(batched)
 }
 
 fn write_dataframe(
+    worker_id: usize,
     writer: &mut BatchedWriter<File>,
     timestamps: &Vec<i64>,
     queries: &Vec<String>,
@@ -140,7 +150,10 @@ fn write_dataframe(
 ) -> ConsumerResult<()> {
     let len = timestamps.len();
     let start_time = std::time::Instant::now();
-    info!("Flushing {} records dataframe to disk", len);
+    info!(
+        "[worker {}] Flushing {} records dataframe to disk",
+        worker_id, len
+    );
 
     let mut data_frame = df!(
         "timestamp" => &timestamps,
@@ -152,7 +165,8 @@ fn write_dataframe(
     writer.write_batch(&mut data_frame)?;
 
     info!(
-        "Flushing {} records dataframe took {:?}",
+        "[worker {}] Flushing {} records dataframe took {:?}",
+        worker_id,
         len,
         start_time.elapsed()
     );
@@ -164,6 +178,7 @@ fn sink_task(
     worker_id: usize,
     msg_count: Arc<AtomicUsize>,
     cancel_token: CancellationToken,
+    outpath: &str,
     flush_treshold: usize,
     rotate_treshold: usize,
     mut rx: Receiver<TaskCommand>,
@@ -177,12 +192,13 @@ fn sink_task(
     let mut shutdown = false;
 
     let filename = format!("queries-{}-{}.parquet", worker_id, rotations + 1);
-    let mut writer: BatchedWriter<File> = open_dataframe_file(&filename).unwrap();
+    let mut writer: BatchedWriter<File> = open_dataframe_file(outpath, &filename).unwrap();
 
     loop {
         let mut forced_flush = false;
 
         if cancel_token.is_cancelled() {
+            info!("[worker {}] Sync task was cancelled...", worker_id);
             shutdown = true;
             forced_flush = true;
         }
@@ -199,7 +215,7 @@ fn sink_task(
                     forced_flush = true;
                 }
                 TaskCommand::Shutdown() => {
-                    info!("[{}] Received sync task shutdown", worker_id);
+                    info!("[worker {}] Received sync task shutdown", worker_id);
                     forced_flush = true;
                     shutdown = true;
                 }
@@ -208,11 +224,7 @@ fn sink_task(
 
         let should_flush = timestamps.len() >= flush_treshold || shutdown;
         if should_flush || forced_flush {
-            let written = write_dataframe(&mut writer, &timestamps, &queries, &bind_vars);
-            if let Err(e) = written {
-                error!("[{}] Failed to write file: {:?}", worker_id, e);
-                continue;
-            }
+            write_dataframe(worker_id, &mut writer, &timestamps, &queries, &bind_vars).unwrap();
 
             flushed += timestamps.len();
 
@@ -223,19 +235,21 @@ fn sink_task(
 
         let should_rotate = flushed >= rotate_treshold;
         if should_rotate {
-            info!("[{}] Rotating output file", worker_id);
+            info!("[worker {}] Rotating output file", worker_id);
             writer.finish().unwrap();
 
             flushed = 0;
             rotations += 1;
 
             writer = open_dataframe_file(
+                outpath,
                 format!("queries-{}-{}.parquet", worker_id, rotations + 1).as_str(),
             )
             .unwrap();
         }
+
         if shutdown {
-            info!("[{}] Terminating worker sync task...", worker_id);
+            info!("[worker {}] Terminating worker sync task...", worker_id);
             writer.finish().unwrap();
             return;
         }
@@ -265,12 +279,13 @@ async fn run_worker(
     // Subscribe to Kafka topic
     consumer
         .subscribe(&topics)
-        .expect(format!("[{}] failed to subscribe to topics", worker_id).as_str());
+        .expect(format!("[worker {}] failed to subscribe to topics", worker_id).as_str());
 
     let (tx, rx) = tokio::sync::mpsc::channel(1000);
 
     let flush_treshold = args.flush_treshold;
     let rotate_treshold = args.rotate_treshold;
+    let outpath = args.outpath.as_str();
 
     let read_msg_count = Arc::new(AtomicUsize::new(0));
     let sink_msg_count = Arc::new(AtomicUsize::new(0));
@@ -283,31 +298,38 @@ async fn run_worker(
     let runtime_handle = Handle::current();
 
     std::thread::scope(move |scope| {
-        info!("[{}] Starting sink thread", worker_id);
         let sink_cancel_token = cancel_token.clone();
         scope.spawn(move || {
+            info!("[worker {}] Starting sink thread", worker_id);
             sink_task(
                 worker_id,
                 sink_msg_count,
                 sink_cancel_token,
+                outpath,
                 flush_treshold,
                 rotate_treshold,
                 rx,
             );
         });
 
-        info!("[{}] Starting consumption thread", worker_id);
         let consume_cancel_token = cancel_token.clone();
-
         scope.spawn(move || {
+            info!("[worker {}] Starting consumption thread", worker_id);
+
             runtime_handle.block_on(async move {
                 loop {
-                    if consume_cancel_token.is_cancelled() {
-                        return;
-                    }
+                    let incoming = tokio::select! {
+                        _ = consume_cancel_token.cancelled() => {
+                            info!("[worker {}] Consume task was cancelled...", worker_id);
+                            break;
+                        }
+                        msg = consumer.recv() => {
+                            msg
+                        }
+                    };
 
-                    match consumer.recv().await {
-                        Err(e) => warn!("[{}] Kafka error: {}", worker_id, e),
+                    match incoming {
+                        Err(e) => warn!("[worker {}] Kafka error: {}", worker_id, e),
                         Ok(msg) => {
                             let kmsg = parse_message(&msg);
 
@@ -334,8 +356,7 @@ async fn run_worker(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+fn parse_cli_args() -> CliArguments {
     let mut matches = Command::new("query-consumer")
         .version(option_env!("CARGO_PKG_VERSION").unwrap_or(""))
         .about("Simple command line consumer to parquet")
@@ -395,9 +416,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .help("Numbers of workers")
                 .default_value("1"),
         )
+        .arg(
+            Arg::new("outpath")
+                .short('o')
+                .long("outpath")
+                .help("Output path")
+                .default_value("./"),
+        )
         .get_matches();
 
-    let cli_args = Arc::new(CliArguments {
+    let cli_args = CliArguments {
         topics: matches.remove_many("topics").unwrap().collect(),
         brokers: matches.remove_one::<String>("brokers").unwrap(),
         consumer_group_id: matches.remove_one::<String>("consumer-group-id").unwrap(),
@@ -405,7 +433,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         rotate_treshold: matches.remove_one::<usize>("rotate-treshold").unwrap(),
         debug: matches.remove_one::<bool>("debug").unwrap(),
         workers: matches.remove_one::<usize>("workers").unwrap(),
-    });
+        outpath: matches.remove_one::<String>("outpath").unwrap(),
+    };
+
+    cli_args
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let cli_args = parse_cli_args();
 
     let log_level = if cli_args.debug {
         LevelFilter::Debug
@@ -440,13 +476,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!("Starting {} workers...", num_workers);
 
     let handle = Arc::new(Handle::current());
+    let args = Arc::new(cli_args);
 
     std::thread::scope(|scope| {
         (0..num_workers)
             .map(|worker_id| {
                 info!("Starting worker {}", worker_id);
                 let child_token = child_token.clone();
-                let args = Arc::clone(&cli_args);
+                let args = Arc::clone(&args);
                 let handle = Arc::clone(&handle);
                 scope.spawn(move || {
                     handle.block_on(run_worker(worker_id, child_token, args))?;
