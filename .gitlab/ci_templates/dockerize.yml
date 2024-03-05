@@ -1,0 +1,18 @@
+include:
+  - local: "/.gitlab/ci_templates/includes/cache.yml"
+  - local: "/.gitlab/ci_templates/includes/task-type.yml"
+
+.step-dockerize:
+  extends:
+    - .task-type-default
+    - .docker_build
+  # image: registry.turbulent.ca/sc/sc-services-docker:v1.0.0
+  cache: !reference [.caches, docker]
+  script:
+    - ci/docker.sh
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: manual
+      allow_failure: true

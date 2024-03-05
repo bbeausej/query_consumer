@@ -1,0 +1,13 @@
+include:
+  - local: "/.gitlab/ci_templates/includes/cache.yml"
+  - local: "/.gitlab/ci_templates/includes/task-type.yml"
+
+.step-build:
+  extends: .task-type-cargo
+  cache:
+    - !reference [.caches, cargo-cache, readonly]
+  artifacts:
+    paths:
+      - "target/debug/*"
+  script:
+    - cargo build

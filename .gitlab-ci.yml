@@ -1,0 +1,38 @@
+image: registry.turbulent.ca/sc/sc-services-ci:v1.1.6
+
+include:
+  - local: "/.gitlab/ci_templates/setup.yml"
+  - local: "/.gitlab/ci_templates/build.yml"
+  - local: "/.gitlab/ci_templates/dockerize.yml"
+  - project: ops/ci-templates
+    ref: master
+    file: "docker-build.yml"
+
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive
+  CACHE_BREAKER: "001"
+
+workflow:
+  rules:
+    - if: $CI_MERGE_REQUEST_IID
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+stages:
+  - build
+  - package
+
+Setup:
+  stage: .pre
+  extends: .step-setup
+
+Build:
+  stage: build
+  extends: .step-build
+  needs: ["Setup"]
+
+Dockerize:
+  stage: package
+  extends: .step-dockerize
+  needs: ["Unit tests", "Lint", "Build"]

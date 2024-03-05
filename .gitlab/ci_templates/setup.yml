@@ -1,0 +1,10 @@
+include:
+  - local: "/.gitlab/ci_templates/includes/cache.yml"
+  - local: "/.gitlab/ci_templates/includes/task-type.yml"
+
+.step-setup:
+  extends: .task-type-default
+  cache:
+    - !reference [.caches, cargo-cache, writable]
+  script:
+    - echo "Preparing cargo build"

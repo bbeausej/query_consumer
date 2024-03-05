@@ -1,0 +1,12 @@
+include:
+  - local: "/.gitlab/ci_templates/includes/cache.yml"
+  - local: "/.gitlab/ci_templates/includes/task-type.yml"
+
+.step-lint:
+  extends: .task-type-cargo
+  cache:
+    - !reference [.caches, cargo-cache, readonly]
+  script:
+    - cargo fmt
+  artifacts:
+    when: always

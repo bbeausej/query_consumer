@@ -1,0 +1,8 @@
+.task-type-default: &task-type-default
+  tags:
+    - docker-executor
+  allow_failure: false
+
+.task-type-cargo:
+  <<: *task-type-default
+  before_script:

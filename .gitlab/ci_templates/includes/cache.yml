@@ -1,0 +1,19 @@
+.caches:
+  cargo-cache:
+    base: &caches--cargo-cache
+      key: "${CI_COMMIT_REF_SLUG}-YARN-${CACHE_BREAKER}"
+      paths:
+        - .cargo/bin
+        - .cargo/registry/index
+        - .cargo/registry/cache
+        - target/debug/deps
+        - target/debug/build
+    writable: *caches--cargo-cache--base
+    readonly:
+      <<: *caches--cargo-cache--base
+      policy: pull
+  docker:
+    key: "$CI_COMMIT_REF_SLUG"
+    paths:
+      - .docker_build_number
+    when: "on_success"
