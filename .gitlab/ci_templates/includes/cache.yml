@@ -1,6 +1,6 @@
 .caches:
   cargo-cache:
-    base: &caches--cargo-cache
+    base: &caches--cargo-cache--base
       key: "${CI_COMMIT_REF_SLUG}-YARN-${CACHE_BREAKER}"
       paths:
         - .cargo/bin

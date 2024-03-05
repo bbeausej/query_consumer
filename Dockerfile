@@ -2,7 +2,7 @@
 FROM rust:alpine as builder
 
 # Install build dependencies
-RUN apk add --no-cache build-base musl-dev openssl-dev openssl bash
+RUN apk add --no-cache build-base musl-dev openssl-dev openssl bash zlib-dev zlib-static
 
 # Create a new empty shell project
 WORKDIR /app
