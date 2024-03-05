@@ -35,4 +35,4 @@ Build:
 Dockerize:
   stage: package
   extends: .step-dockerize
-  needs: ["Unit tests", "Lint", "Build"]
+  needs: ["Build"]
