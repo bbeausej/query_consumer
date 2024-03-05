@@ -10,4 +10,5 @@ include:
     paths:
       - "target/debug/*"
   script:
+    - apk add --no-cache build-base musl-dev openssl-dev openssl bash zlib-dev zlib-static
     - cargo build
