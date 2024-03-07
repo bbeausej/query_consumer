@@ -1,4 +1,4 @@
-#!/bin/bash -ex
+#!/bin/bash -e
 
 set -e
 
@@ -24,7 +24,7 @@ export DOCKER_BUILD_CMD="docker buildx build --platform linux/amd64,linux/arm64 
 # Build the main image
 echo "Building the base image"
 time ${DOCKER_BUILD_CMD} -f docker/Dockerfile \
-  -t ${HARBOR_REGISTRY}/${DOCKER_NAMESPACE}/${BASE_IMAGE}:${IMAGE_TAG}
+  -t ${HARBOR_REGISTRY}/${DOCKER_NAMESPACE}/${BASE_IMAGE}:${IMAGE_TAG} .
 
 
 if [[ ${CI_JOB_MANUAL} == "true" ]]; then
