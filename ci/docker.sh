@@ -19,7 +19,7 @@ echo "Creating the Docker builder"
 docker buildx create --name services-builder --driver docker-container --use --bootstrap
 
 # We build Arm and x64 images and push them to ECR and Turbulent's registry
-export DOCKER_BUILD_CMD="docker buildx build --platform linux/amd64,linux/arm64 --progress plain --push"
+export DOCKER_BUILD_CMD="docker buildx build --platform linux/amd64 --progress plain --push"
 
 # Build the main image
 echo "Building the base image"
