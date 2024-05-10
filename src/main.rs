@@ -42,6 +42,7 @@ struct KafkaQueryBody {
     time: i64,
     query: String,
     bind_vars: serde_json::value::Value,
+    database: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -127,6 +128,7 @@ fn get_dataframe_schema() -> Schema {
         Field::new("timestamp", DataType::Int64),
         Field::new("query", DataType::String),
         Field::new("bind_vars", DataType::String),
+        Field::new("database", DataType::String),
     ])
 }
 
@@ -155,14 +157,14 @@ fn write_dataframe(
         worker_id, len
     );
 
-    let mut data_frame = df!(
+    let data_frame = df!(
         "timestamp" => &timestamps,
         "query" => &queries,
         "bind_vars" => &bind_vars,
     )?
     .sort(["timestamp"], true, false)?;
 
-    writer.write_batch(&mut data_frame)?;
+    writer.write_batch(&data_frame)?;
 
     info!(
         "[worker {}] Flushing {} records dataframe took {:?}",
@@ -182,12 +184,13 @@ fn sink_task(
     flush_treshold: usize,
     rotate_treshold: usize,
     mut rx: Receiver<TaskCommand>,
-) -> () {
+) {
     let mut rotations: usize = 0;
     let mut flushed: usize = 0;
     let mut timestamps: Vec<i64> = Vec::with_capacity(flush_treshold);
     let mut queries: Vec<String> = Vec::with_capacity(flush_treshold);
     let mut bind_vars: Vec<String> = Vec::with_capacity(flush_treshold);
+    let mut databases: Vec<String> = Vec::with_capacity(flush_treshold);
 
     let mut shutdown = false;
 
@@ -209,6 +212,11 @@ fn sink_task(
                     timestamps.push(message.body.time);
                     queries.push(message.body.query);
                     bind_vars.push(message.body.bind_vars.to_string());
+                    if let Some(db) = message.body.database {
+                        databases.push(db);
+                    } else {
+                        databases.push("".to_string());
+                    }
                     msg_count.fetch_add(1, atomic::Ordering::Relaxed);
                 }
                 TaskCommand::Flush() => {
@@ -279,7 +287,7 @@ async fn run_worker(
     // Subscribe to Kafka topic
     consumer
         .subscribe(&topics)
-        .expect(format!("[worker {}] failed to subscribe to topics", worker_id).as_str());
+        .unwrap_or_else(|_| panic!("[worker {}] failed to subscribe to topics", worker_id));
 
     let (tx, rx) = tokio::sync::mpsc::channel(1000);
 
@@ -425,7 +433,7 @@ fn parse_cli_args() -> CliArguments {
         )
         .get_matches();
 
-    let cli_args = CliArguments {
+    CliArguments {
         topics: matches.remove_many("topics").unwrap().collect(),
         brokers: matches.remove_one::<String>("brokers").unwrap(),
         consumer_group_id: matches.remove_one::<String>("consumer-group-id").unwrap(),
@@ -434,9 +442,7 @@ fn parse_cli_args() -> CliArguments {
         debug: matches.remove_one::<bool>("debug").unwrap(),
         workers: matches.remove_one::<usize>("workers").unwrap(),
         outpath: matches.remove_one::<String>("outpath").unwrap(),
-    };
-
-    cli_args
+    }
 }
 
 #[tokio::main]
