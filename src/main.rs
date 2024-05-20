@@ -149,6 +149,7 @@ fn write_dataframe(
     timestamps: &Vec<i64>,
     queries: &Vec<String>,
     bind_vars: &Vec<String>,
+    databases: &Vec<String>,
 ) -> ConsumerResult<()> {
     let len = timestamps.len();
     let start_time = std::time::Instant::now();
@@ -161,6 +162,7 @@ fn write_dataframe(
         "timestamp" => &timestamps,
         "query" => &queries,
         "bind_vars" => &bind_vars,
+        "database" => &databases,
     )?
     .sort(["timestamp"], true, false)?;
 
@@ -232,13 +234,22 @@ fn sink_task(
 
         let should_flush = timestamps.len() >= flush_treshold || shutdown;
         if should_flush || forced_flush {
-            write_dataframe(worker_id, &mut writer, &timestamps, &queries, &bind_vars).unwrap();
+            write_dataframe(
+                worker_id,
+                &mut writer,
+                &timestamps,
+                &queries,
+                &bind_vars,
+                &databases,
+            )
+            .unwrap();
 
             flushed += timestamps.len();
 
             timestamps.clear();
             queries.clear();
             bind_vars.clear();
+            databases.clear();
         }
 
         let should_rotate = flushed >= rotate_treshold;
